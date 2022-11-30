@@ -7,3 +7,7 @@ pub enum RunningState {
     Running,
     Paused,
 }
+
+pub(crate) trait Hash {
+    fn hash(&self) -> Vec<u8>;
+}
