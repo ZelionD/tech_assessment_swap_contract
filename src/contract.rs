@@ -20,10 +20,8 @@ pub struct Contract {
 impl Contract {
     /// Initializes contract
     #[init]
-    pub fn init() -> Self {
-        let owner_id = env::predecessor_account_id();
-
-        Self::new(owner_id.clone())
+    pub fn init(owner_id: Option<AccountId>) -> Self {
+        Self::new(owner_id.unwrap_or_else(|| env::predecessor_account_id()))
     }
 }
 
