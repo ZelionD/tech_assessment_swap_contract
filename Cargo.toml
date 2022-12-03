@@ -9,3 +9,11 @@ crate-type = ["cdylib"]
 [dependencies]
 near-sdk = { version = "4.1.1", features = [] }
 near-contract-standards = "4.1.1"
+primitive-types = {version = "0.12.1", default-features = false}
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+workspaces = { version = "0.7.0", features = ["unstable"] }
+near-units = "0.2.0"
+tokio = { version = "1.22.0", features = ["full"] }
+anyhow = "1.0.66"
