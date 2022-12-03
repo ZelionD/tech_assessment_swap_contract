@@ -12,15 +12,18 @@ use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::serde_json;
 use near_sdk::{
     env, ext_contract, near_bindgen, AccountId, Promise, PromiseError, PromiseOrValue, ONE_NEAR,
+    ONE_YOCTO,
 };
+use primitive_types::U256;
 use std::cmp::Ordering;
 
-#[derive(BorshDeserialize, BorshSerialize)]
-pub(crate) struct TokenWallet {
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct TokenWallet {
     token_id: AccountId,
     metadata: FungibleTokenMetadata,
-    deposit: u128,
-    liquidity: u128,
+    deposit: U128,
+    liquidity: U128,
 }
 
 pub(crate) trait TokenWalletProvider {
@@ -35,6 +38,24 @@ pub(crate) trait TokenWalletProvider {
         token2_metadata: Result<FungibleTokenMetadata, PromiseError>,
         token2_wallet_storage_balance: Result<StorageBalance, PromiseError>,
     );
+}
+
+pub(crate) trait SwapProvider {
+    fn swap_tokens(
+        &mut self,
+        sender_id: AccountId,
+        token_id_in: AccountId,
+        amount_in: u128,
+    ) -> Result<PromiseOrValue<U128>, &'static str>;
+
+    fn on_swap_complete(
+        &mut self,
+        token_wallet_in: TokenWallet,
+        token_wallet_out: TokenWallet,
+        token1_is_input: bool,
+        amount_in: U128,
+        transfer_result: Result<(), PromiseError>,
+    ) -> PromiseOrValue<U128>;
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -117,13 +138,125 @@ impl FungibleTokenReceiver for Contract {
             _ => self.on_transfer_deposit(sender_id, token_id, amount),
         };
 
-        if let Err(e) = result {
-            env::log_str(&*format!("Transfer failed. Error: {}", e));
+        match result {
+            Err(e) => {
+                env::log_str(&*format!("Transfer failed. Error: {}", e));
 
-            // In case of any error refund full transferred amount
-            PromiseOrValue::Value(amount)
+                // In case of any error refund full transferred amount
+                PromiseOrValue::Value(amount)
+            }
+
+            Ok(result) => result,
+        }
+    }
+}
+
+#[near_bindgen]
+impl SwapProvider for Contract {
+    #[handle_result]
+    fn swap_tokens(
+        &mut self,
+        sender_id: AccountId,
+        token_id_in: AccountId,
+        amount_in: u128,
+    ) -> Result<PromiseOrValue<U128>, &'static str> {
+        env::log_str(&*format!(
+            "User {:?} requests to swap {} `{}` token(s)",
+            sender_id, amount_in, token_id_in
+        ));
+
+        let (token_wallet_in, token_wallet_out, token1_is_input) =
+            self.get_swap_tokens_wallets_mut(&token_id_in)?;
+
+        let ratio = compute_tokens_ratio(
+            token_wallet_in.liquidity.into(),
+            token_wallet_out.liquidity.into(),
+        )?;
+
+        let amount_out = if token1_is_input {
+            // amount_out = token2_liquidity - ratio / (token1_liquidity + amount_in)
+            U256::from(u128::from(token_wallet_in.liquidity))
+                .checked_add(amount_in.into())
+                .and_then(|sum| ratio.checked_div(sum))
+                .and_then(|res| U256::from(u128::from(token_wallet_out.liquidity)).checked_sub(res))
+                .ok_or("Computation overflow")?
+                .as_u128()
         } else {
-            PromiseOrValue::Value(0.into())
+            // amount_out = ratio / (token2_liquidity - amount_in) - token1_liquidity
+            U256::from(u128::from(token_wallet_in.liquidity))
+                .checked_sub(amount_in.into())
+                .and_then(|sub| ratio.checked_div(sub))
+                .and_then(|res| res.checked_sub(U256::from(u128::from(token_wallet_out.liquidity))))
+                .ok_or("Computation overflow")?
+                .as_u128()
+        };
+
+        env::log_str(&*format!(
+            "Swap {} {} for {} {}",
+            amount_in,
+            token_wallet_in.metadata.symbol,
+            amount_out,
+            token_wallet_out.metadata.symbol
+        ));
+
+        let mut token_wallet_in_new = token_wallet_in.clone();
+        token_wallet_in_new.liquidity = u128::from(token_wallet_in.liquidity)
+            .checked_add(amount_in)
+            .ok_or("Input token liquidity overflow")?
+            .into();
+
+        let mut token_wallet_out_new = token_wallet_out.clone();
+        token_wallet_out_new.liquidity = u128::from(token_wallet_out_new.liquidity)
+            .checked_sub(amount_out)
+            .ok_or("Output token liquidity overflow")?
+            .into();
+
+        Ok(ext_ft_core::ext(token_wallet_out.token_id.clone())
+            .with_attached_deposit(ONE_YOCTO)
+            .ft_transfer(sender_id, amount_out.into(), None)
+            .then(Self::ext(env::current_account_id()).on_swap_complete(
+                token_wallet_in_new,
+                token_wallet_out_new,
+                token1_is_input,
+                amount_in.into(),
+            ))
+            .into())
+    }
+
+    #[private]
+    fn on_swap_complete(
+        &mut self,
+        token_wallet_in: TokenWallet,
+        token_wallet_out: TokenWallet,
+        token1_is_input: bool,
+        amount_in: U128,
+        #[callback_result] transfer_result: Result<(), PromiseError>,
+    ) -> PromiseOrValue<U128> {
+        match transfer_result {
+            Ok(_) if token1_is_input => {
+                self.token1_wallet = Some(token_wallet_in);
+                self.token2_wallet = Some(token_wallet_out);
+
+                PromiseOrValue::Value(0.into())
+            }
+
+            Ok(_) => {
+                self.token1_wallet = Some(token_wallet_out);
+                self.token2_wallet = Some(token_wallet_in);
+
+                PromiseOrValue::Value(0.into())
+            }
+
+            Err(_) => {
+                env::log_str(&*format!(
+                    "Swap tokens {} `{:?}` for `{:?}` failed!",
+                    u128::from(amount_in),
+                    token_wallet_in.metadata.symbol,
+                    token_wallet_out.metadata.symbol
+                ));
+
+                PromiseOrValue::Value(amount_in)
+            }
         }
     }
 }
@@ -135,31 +268,28 @@ impl Contract {
         sender_id: AccountId,
         token_id: AccountId,
         amount: U128,
-    ) -> Result<(), &'static str> {
+    ) -> Result<PromiseOrValue<U128>, &'static str> {
         if !self.is_owner(&sender_id) {
             return Err("Deposit can be added only by contract owner");
         }
 
         let token_wallet = self.get_token_wallet_mut(&token_id)?;
 
-        token_wallet.deposit = token_wallet
-            .deposit
-            .checked_add(amount.0)
-            .ok_or("Token deposit overflow")?;
+        token_wallet.deposit = u128::from(token_wallet.deposit)
+            .checked_add(amount.into())
+            .ok_or("Token deposit overflow")?
+            .into();
 
-        Ok(())
+        Ok(PromiseOrValue::Value(0.into()))
     }
 
     fn on_transfer_swap(
         &mut self,
         sender_id: AccountId,
-        token_id: AccountId,
-        amount: U128,
-    ) -> Result<(), &'static str> {
-        let (token_in, token_out) = self.get_swap_tokens_wallets_mut(&token_id)?;
-
-        // TODO: some swap computation
-        Err("Not implemented")
+        token_id_in: AccountId,
+        amount_in: U128,
+    ) -> Result<PromiseOrValue<U128>, &'static str> {
+        self.swap_tokens(sender_id, token_id_in, amount_in.into())
     }
 
     /// Adds liquidity to the pool from owner's deposit by provided amounts
@@ -178,24 +308,24 @@ impl Contract {
             .ok_or("Token2 wallet is not created")?;
 
         // Move tokens from deposit
-        token1_wallet.deposit = token1_wallet
-            .deposit
-            .checked_sub(amounts[0].0)
-            .ok_or("Not enough deposit for Token1")?;
-        token2_wallet.deposit = token2_wallet
-            .deposit
-            .checked_sub(amounts[1].0)
-            .ok_or("Not enough deposit for Token2")?;
+        token1_wallet.deposit = u128::from(token1_wallet.deposit)
+            .checked_sub(amounts[0].into())
+            .ok_or("Not enough deposit for Token1")?
+            .into();
+        token2_wallet.deposit = u128::from(token2_wallet.deposit)
+            .checked_sub(amounts[1].into())
+            .ok_or("Not enough deposit for Token2")?
+            .into();
 
         // Move tokens to liquidity
-        token1_wallet.liquidity = token1_wallet
-            .liquidity
-            .checked_add(amounts[0].0)
-            .ok_or("Liquidity overflow for Token1")?;
-        token2_wallet.liquidity = token2_wallet
-            .liquidity
-            .checked_add(amounts[1].0)
-            .ok_or("Liquidity overflow for Token2")?;
+        token1_wallet.liquidity = u128::from(token1_wallet.liquidity)
+            .checked_add(amounts[0].into())
+            .ok_or("Liquidity overflow for Token1")?
+            .into();
+        token2_wallet.liquidity = u128::from(token2_wallet.liquidity)
+            .checked_add(amounts[1].into())
+            .ok_or("Liquidity overflow for Token2")?
+            .into();
 
         Ok(())
     }
@@ -216,24 +346,24 @@ impl Contract {
             .ok_or("Token2 wallet is not created")?;
 
         // Move tokens from liquidity
-        token1_wallet.liquidity = token1_wallet
-            .liquidity
-            .checked_sub(amounts[0].0)
-            .ok_or("Not enough liquidity for Token1")?;
-        token2_wallet.liquidity = token2_wallet
-            .liquidity
-            .checked_sub(amounts[1].0)
-            .ok_or("Not enough liquidity for Token2")?;
+        token1_wallet.liquidity = u128::from(token1_wallet.liquidity)
+            .checked_sub(amounts[0].into())
+            .ok_or("Not enough liquidity for Token1")?
+            .into();
+        token2_wallet.liquidity = u128::from(token2_wallet.liquidity)
+            .checked_sub(amounts[1].into())
+            .ok_or("Not enough liquidity for Token2")?
+            .into();
 
         // Move tokens to deposit
-        token1_wallet.deposit = token1_wallet
-            .deposit
-            .checked_add(amounts[0].0)
-            .ok_or("Deposit overflow for Token1")?;
-        token2_wallet.deposit = token2_wallet
-            .deposit
-            .checked_add(amounts[1].0)
-            .ok_or("Deposit overflow for Token2")?;
+        token1_wallet.deposit = u128::from(token1_wallet.deposit)
+            .checked_add(amounts[0].into())
+            .ok_or("Deposit overflow for Token1")?
+            .into();
+        token2_wallet.deposit = u128::from(token2_wallet.deposit)
+            .checked_add(amounts[1].into())
+            .ok_or("Deposit overflow for Token2")?
+            .into();
 
         Ok(())
     }
@@ -262,15 +392,18 @@ impl Contract {
                 token1_wallet.liquidity.into(),
                 token2_wallet.liquidity.into(),
             ],
-            ratio: compute_tokens_ratio(token1_wallet.liquidity, token2_wallet.liquidity)?
-                .to_string(),
+            ratio: compute_tokens_ratio(
+                token1_wallet.liquidity.into(),
+                token2_wallet.liquidity.into(),
+            )?
+            .to_string(),
         })
     }
 
     pub(crate) fn get_swap_tokens_wallets_mut(
         &mut self,
         token_id_in: &AccountId,
-    ) -> Result<(&mut TokenWallet, &mut TokenWallet), &'static str> {
+    ) -> Result<(&mut TokenWallet, &mut TokenWallet, bool), &'static str> {
         let token1_wallet = self
             .token1_wallet
             .as_mut()
@@ -281,8 +414,8 @@ impl Contract {
             .ok_or("Token2 wallet is not registered")?;
 
         match token_id_in.cmp(&token1_wallet.token_id) {
-            Ordering::Equal => Ok((token1_wallet, token2_wallet)),
-            _ => Ok((token2_wallet, token1_wallet)),
+            Ordering::Equal => Ok((token1_wallet, token2_wallet, true)),
+            _ => Ok((token2_wallet, token1_wallet, false)),
         }
     }
 
@@ -316,20 +449,20 @@ impl TokenWallet {
         Self {
             token_id,
             metadata,
-            deposit: 0,
-            liquidity: 0,
+            deposit: U128(0),
+            liquidity: U128(0),
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(crate = "near_sdk::serde", rename_all = "snake_case")]
-pub(crate) struct TransferCommand {
-    r#type: TransferType,
+pub struct TransferCommand {
+    pub r#type: TransferType,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(crate = "near_sdk::serde", rename_all = "snake_case")]
-pub(crate) enum TransferType {
+pub enum TransferType {
     Swap,
 }
