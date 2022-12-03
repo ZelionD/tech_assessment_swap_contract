@@ -27,7 +27,7 @@ impl Contract {
     #[init]
     pub fn init(owner_id: Option<AccountId>, tokens: Option<(AccountId, AccountId)>) -> Self {
         let mut contract = Self {
-            owner_id: owner_id.unwrap_or_else(|| env::predecessor_account_id()),
+            owner_id: owner_id.unwrap_or_else(env::predecessor_account_id),
             running_state: RunningState::Running,
             accounts: LookupMap::new(StorageKey::Accounts),
             token1_wallet: None,
@@ -86,7 +86,7 @@ impl Contract {
     pub(crate) fn get_account(&self, account_id: &AccountId) -> Result<Account, &'static str> {
         self.accounts
             .get(account_id)
-            .map(|v_acc| Account::from(v_acc))
+            .map(Account::from)
             .ok_or("Account is not registered")
     }
 }

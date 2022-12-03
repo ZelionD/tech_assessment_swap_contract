@@ -388,10 +388,7 @@ impl Contract {
                 token1_wallet.metadata.decimals,
                 token2_wallet.metadata.decimals,
             ],
-            amounts: [
-                token1_wallet.liquidity.into(),
-                token2_wallet.liquidity.into(),
-            ],
+            amounts: [token1_wallet.liquidity, token2_wallet.liquidity],
             ratio: compute_tokens_ratio(
                 token1_wallet.liquidity.into(),
                 token2_wallet.liquidity.into(),

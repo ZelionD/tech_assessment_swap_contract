@@ -36,8 +36,7 @@ impl StorageManagement for Contract {
                 account.storage_balance = account
                     .storage_balance
                     .checked_add(deposit_amount)
-                    .unwrap_or_else(|| env::panic_str("Storage balance overflow"))
-                    .into();
+                    .unwrap_or_else(|| env::panic_str("Storage balance overflow"));
                 account
             }
 
@@ -53,11 +52,11 @@ impl StorageManagement for Contract {
                     Promise::new(env::predecessor_account_id()).transfer(refund);
                 }
 
-                Account::new(&account_id, Some(min_balance.into()))
+                Account::new(&account_id, Some(min_balance))
             }
 
             // else register account with all deposit
-            _ => Account::new(&account_id, Some(deposit_amount.into())),
+            _ => Account::new(&account_id, Some(deposit_amount)),
         };
 
         let storage_balance = account.storage_balance();
